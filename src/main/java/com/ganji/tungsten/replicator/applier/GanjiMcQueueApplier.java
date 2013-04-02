@@ -25,6 +25,7 @@ package com.ganji.tungsten.replicator.applier;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.sql.Timestamp;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.regex.Matcher;
@@ -35,6 +36,8 @@ import net.spy.memcached.AddrUtil;
 import net.spy.memcached.ConnectionFactoryBuilder;
 import net.spy.memcached.DefaultConnectionFactory;
 import net.spy.memcached.MemcachedClient;
+import net.spy.memcached.transcoders.SerializingTranscoder;
+import net.spy.memcached.transcoders.Transcoder;
 
 import org.apache.log4j.Logger;
 import org.json.simple.JSONObject;
@@ -76,7 +79,7 @@ public class GanjiMcQueueApplier extends RowDataApplier
     protected String					queue_addr			 = "";
     protected String					queue_name			 = "noname";
      
-    //protected String                   db                   = null;
+    protected String                   db                   = null;
     
     public void setQueueAddr(String mcQueueHost) {
 		queue_addr = mcQueueHost;
@@ -85,17 +88,21 @@ public class GanjiMcQueueApplier extends RowDataApplier
 	public void setQueueName(String mcQueueName) {
 		queue_name = mcQueueName;
 	}
+    public void setDb(String db) {
+        this.db = db;
+    }
 	
     public Database getDatabase()
     {
         return conn;
     }
 
-    private boolean insert2Queue(String schema, String table, String actionName, JSONObject obj ) throws ApplierException
+    private boolean insert2Queue(String schema, String table, String actionName, JSONObject obj, Timestamp tm ) throws ApplierException
     {
         obj.put( "__schema", schema );
         obj.put( "__table", table );
         obj.put( "__action", actionName );
+        obj.put( "__ts", tm.getTime() );
         
         Future<Boolean> f = mc_conn.set( queue_name, 0, obj.toJSONString() );
         try {
@@ -226,10 +233,11 @@ public class GanjiMcQueueApplier extends RowDataApplier
 
         try
         {
-            
+            String schema = db;
+            if( db == null ) db = context.getReplicatorSchemaName();            
             // Create the database.
             conn = DatabaseFactory.createDatabase(
-            		runtime.getJdbcUrl(context.getReplicatorSchemaName()),
+            		runtime.getJdbcUrl(db),
             		runtime.getJdbcUser(),
             		runtime.getJdbcPassword()
             		);
@@ -238,7 +246,7 @@ public class GanjiMcQueueApplier extends RowDataApplier
             statement = conn.createStatement();
             
             commitSeqnoTable = new CommitSeqnoTable(conn,
-                    context.getReplicatorSchemaName(),  // 2.0.6
+                    db,  // 2.0.6
                     runtime.getTungstenTableType(), false );
             commitSeqnoTable.prepare(taskId);
             latestHeader = commitSeqnoTable.lastCommitSeqno(taskId);
@@ -248,7 +256,7 @@ public class GanjiMcQueueApplier extends RowDataApplier
         {
             throw new ReplicatorException(
                     "Unable to connect to MySQL: url="
-                    + runtime.getJdbcUrl(context.getReplicatorSchemaName()) 
+                    + runtime.getJdbcUrl(db) 
                     + ",user=" + runtime.getJdbcUser() 
                     + ",password" + runtime.getJdbcPassword(), e);
         }
@@ -256,7 +264,7 @@ public class GanjiMcQueueApplier extends RowDataApplier
         
         try {
         	mc_conn = new MemcachedClient(
-        			new ConnectionFactoryBuilder().
+        			new ConnectionFactoryBuilder(new FixConnectionFactory() ).
         				//setFailureMode(fm).
         				setOpTimeout(30*1000).
         				build(),
@@ -299,16 +307,23 @@ public class GanjiMcQueueApplier extends RowDataApplier
     }
 
 	@Override
-	protected void onRowData(String schema, String table, int aCTIONINSERT, JSONObject doc) throws ApplierException {
+	protected void onRowData(String schema, String table, int aCTIONINSERT, JSONObject doc, Timestamp tm) throws ApplierException {
 		if( aCTIONINSERT == ACTION_INSERT) {
-			insert2Queue( schema, table, "insert", doc );
+			insert2Queue( schema, table, "insert", doc, tm);
 		}
 		else if(aCTIONINSERT == ACTION_UPDATE) {
-			insert2Queue( schema, table, "update", doc );
+			insert2Queue( schema, table, "update", doc, tm );
 		}
 		else if(aCTIONINSERT == ACTION_DELETE) {
-			insert2Queue( schema, table, "delete", doc );
+			insert2Queue( schema, table, "delete", doc, tm );
 		}
 		
 	}
+    class FixConnectionFactory extends DefaultConnectionFactory {
+		 public Transcoder<Object> getDefaultTranscoder() {
+			 SerializingTranscoder obj = new SerializingTranscoder();
+			 obj.setCompressionThreshold(10000000); // set to 1M ,which is impossible
+			 return obj;
+		 }
+    }
 }
